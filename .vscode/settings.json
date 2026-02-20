@@ -1,0 +1,10 @@
+{
+  "chat.tools.terminal.autoApprove": {
+    "cargo search": true,
+    "cargo info": true,
+    "/^sudo apt update && sudo apt install -y protobuf-compiler$/": {
+      "approve": true,
+      "matchCommandLine": true
+    }
+  }
+}
