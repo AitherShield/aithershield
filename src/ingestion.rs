@@ -83,7 +83,7 @@ pub fn anonymize_log(raw: &str) -> (String, Vec<String>) {
     }
 
     // Mask API keys/hashes (long alphanumeric strings)
-    let key_regex = Regex::new(r"\b[A-Za-z0-9]{20,}\b").unwrap();
+    let key_regex = Regex::new(r"\b[A-Za-z0-9]{10,}\b").unwrap();
     if key_regex.is_match(&result) {
         masked_fields.push("API key/hash".to_string());
         result = key_regex.replace_all(&result, "[KEY]").to_string();

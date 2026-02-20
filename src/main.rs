@@ -76,7 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Try to connect to Chroma
-    let chroma_url = std::env::var("CHROMA_URL").unwrap_or_else(|_| "http://chroma:8000".to_string());
+    let chroma_url = std::env::var("CHROMA_URL").unwrap_or_else(|_| "http://localhost:8000".to_string());
     match storage::ChromaStore::new(&chroma_url, "aithershield_logs").await {
         Ok(store) => {
             analyzer = analyzer.with_chroma_store(store);
