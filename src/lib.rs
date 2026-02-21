@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -438,9 +439,12 @@ impl FromStr for LogSeverity {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalysisResult {
+    pub id: String,
+    pub timestamp: DateTime<Utc>,
     pub severity: LogSeverity,
-    pub explanation: String,
-    pub recommended_action: String,
+    pub summary: String,
+    pub details: Option<String>,
+    pub related_alerts: Vec<String>,
     pub confidence: f32,
 }
 
@@ -586,11 +590,11 @@ impl SiemAnalyzer {
             for result in &results {
                 if result.severity >= self.alert_min_severity || (result.severity == LogSeverity::Medium && result.confidence < 0.5) {
                     let alert = alerting::Alert::new(
-                        // We don't have the original log here, so use explanation as id
-                        result.explanation.clone(),
+                        // We don't have the original log here, so use summary as id
+                        result.summary.clone(),
                         result.severity.clone(),
-                        result.explanation.clone(),
-                        result.recommended_action.clone(),
+                        result.summary.clone(),
+                        "Review and investigate".to_string(),
                         result.confidence,
                     );
                     if let Err(e) = alerting::trigger_alert(&alert, &self.alert_channels, manager).await {
@@ -711,7 +715,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/generate"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "response": "{\"severity\": \"medium\", \"explanation\": \"Test explanation\", \"recommended_action\": \"Test action\", \"confidence\": 0.8}",
+                "response": "{\"id\": \"test-id\", \"timestamp\": \"2026-02-20T14:30:00Z\", \"severity\": \"medium\", \"summary\": \"Test explanation\", \"details\": null, \"related_alerts\": [], \"confidence\": 0.8}",
                 "done": true
             })))
             .mount(&mock_server)

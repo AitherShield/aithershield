@@ -21,6 +21,9 @@ ratatui = "0.26"
 crossterm = { version = "0.27", features = ["event-stream"] }
 color-eyre = "0.6"
 futures = "0.3"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+axum = { version = "0.7", features = ["json"] }
+elasticsearch = "9.1.0-alpha.1"
 chroma = { version = "0.13", default-features = false, features = ["rustls"], optional = true }
 
 [features]
@@ -36,3 +39,7 @@ path = "src/main.rs"
 [[bin]]
 name = "tui"
 path = "src/bin/tui.rs"
+
+[[bin]]
+name = "api"
+path = "src/bin/api.rs"

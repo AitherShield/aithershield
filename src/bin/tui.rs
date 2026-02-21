@@ -1,7 +1,15 @@
-use aithershield::{alerting::Alert, LogSeverity, SiemAnalyzer, LlmBackend, OllamaBackend, AnalysisResult};
+use aithershield::{alerting::Alert, LogSeverity, SiemAnalyzer, LlmBackend, OllamaBackend, AnalysisResult, storage};
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::Json,
+    routing::{get, post},
+    Router,
+};
 use chrono::{DateTime, Utc};
 use color_eyre::Result;
 use crossterm::{
+    cursor::Show,
     event::{DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -14,12 +22,87 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Tabs, Wrap},
     Frame, Terminal,
 };
+use serde::{Deserialize, Serialize};
 use std::{
     io,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
+use tokio::signal;
+use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use uuid::Uuid;
+
+#[derive(Deserialize)]
+struct AnalyzeRequest {
+    logs: String,
+}
+
+#[derive(Serialize)]
+struct StatusResponse {
+    alerts_count: usize,
+    analyses_count: usize,
+    uptime_seconds: u64,
+    last_update_ago: String,
+}
+
+type SharedApp = Arc<Mutex<App>>;
+
+async fn get_root() -> &'static str {
+    "AitherShield SIEM API Server\n\nEndpoints:\n  GET  /status  - System status\n  GET  /alerts  - List alerts\n  POST /analyze - Analyze logs\n"
+}
+
+fn create_router(shared_app: SharedApp) -> Router {
+    Router::new()
+        .route("/", get(get_root))
+        .route("/alerts", get(get_alerts))
+        .route("/analyze", post(post_analyze))
+        .route("/status", get(get_status))
+        .layer(CorsLayer::permissive())
+        .layer(TraceLayer::new_for_http())
+        .with_state(shared_app)
+}
+
+async fn get_alerts(State(shared_app): State<SharedApp>) -> Json<Vec<Alert>> {
+    let app = shared_app.lock().unwrap();
+    Json(app.alerts.clone())
+}
+
+async fn post_analyze(
+    State(shared_app): State<SharedApp>,
+    Json(req): Json<AnalyzeRequest>,
+) -> Result<Json<AnalysisResult>, StatusCode> {
+    let mut app = shared_app.lock().unwrap();
+
+    // Perform analysis (simplified for now)
+    let analysis = AnalysisResult {
+        id: Uuid::new_v4().to_string(),
+        timestamp: chrono::Utc::now(),
+        severity: LogSeverity::Medium,
+        summary: "Analysis completed".to_string(),
+        details: Some(req.logs),
+        related_alerts: vec![],
+        confidence: 0.8,
+    };
+
+    app.analyses.push(analysis.clone());
+    app.last_update = std::time::Instant::now();
+
+    Ok(Json(analysis))
+}
+
+async fn get_status(State(shared_app): State<SharedApp>) -> Json<StatusResponse> {
+    let app = shared_app.lock().unwrap();
+    let uptime = app.start_time.elapsed().as_secs();
+    let last_update_ago = format!("{}s ago", app.last_update.elapsed().as_secs());
+
+    Json(StatusResponse {
+        alerts_count: app.alerts.len(),
+        analyses_count: app.analyses.len(),
+        uptime_seconds: uptime,
+        last_update_ago,
+    })
+}
 use tokio::time;
 use futures::StreamExt;
 
@@ -67,6 +150,7 @@ enum AppEvent {
 struct App {
     alerts: Vec<Alert>,
     analyses: Vec<AnalysisResult>,
+    es_store: Option<storage::elasticsearch::EsStore>,
     tab: Tab,
     alert_list_state: ListState,
     analysis_list_state: ListState,
@@ -74,13 +158,15 @@ struct App {
     selected_analysis_details: Option<usize>,
     status_info: String,
     last_update: Instant,
+    start_time: Instant,
 }
 
-impl Default for App {
-    fn default() -> Self {
-        Self {
+impl App {
+    async fn new() -> Self {
+        let mut app = Self {
             alerts: Vec::new(),
             analyses: Vec::new(),
+            es_store: None,
             tab: Tab::Alerts,
             alert_list_state: ListState::default(),
             analysis_list_state: ListState::default(),
@@ -88,7 +174,36 @@ impl Default for App {
             selected_analysis_details: None,
             status_info: "Initializing...".to_string(),
             last_update: Instant::now(),
+            start_time: Instant::now(),
+        };
+
+        // Try to connect to Elasticsearch and load recent data
+        if let Ok(es_url) = std::env::var("ELASTICSEARCH_URL") {
+            match storage::elasticsearch::EsStore::new(&es_url).await {
+                Ok(store) => {
+                    app.es_store = Some(store);
+                    app.status_info = format!("Connected to Elasticsearch at {}", es_url);
+
+                    // Load recent alerts and analyses
+                    if let Ok(alerts) = app.es_store.as_ref().unwrap().query_recent_alerts(100, None).await {
+                        app.alerts = alerts;
+                        app.status_info = format!("Loaded {} alerts from ES", app.alerts.len());
+                    }
+
+                    if let Ok(analyses) = app.es_store.as_ref().unwrap().query_recent_analyses(100, None).await {
+                        app.analyses = analyses;
+                        app.status_info = format!("Loaded {} alerts, {} analyses from ES", app.alerts.len(), app.analyses.len());
+                    }
+                }
+                Err(e) => {
+                    app.status_info = format!("ES connection failed: {}", e);
+                }
+            }
+        } else {
+            app.status_info = "No ES configured, in-memory only".to_string();
         }
+
+        app
     }
 }
 
@@ -168,13 +283,35 @@ impl App {
     }
 
     fn on_new_alert(&mut self, alert: Alert) {
-        self.alerts.push(alert);
+        self.alerts.push(alert.clone());
         self.last_update = Instant::now();
+
+        // Index to Elasticsearch if available (spawn async task)
+        if let Some(ref es_store) = self.es_store {
+            let store = es_store.clone();
+            let alert_clone = alert.clone();
+            tokio::spawn(async move {
+                if let Err(e) = store.index_alert(&alert_clone).await {
+                    eprintln!("Failed to index alert to Elasticsearch: {}", e);
+                }
+            });
+        }
     }
 
     fn on_new_analysis(&mut self, analysis: AnalysisResult) {
-        self.analyses.push(analysis);
+        self.analyses.push(analysis.clone());
         self.last_update = Instant::now();
+
+        // Index to Elasticsearch if available (spawn async task)
+        if let Some(ref es_store) = self.es_store {
+            let store = es_store.clone();
+            let analysis_clone = analysis.clone();
+            tokio::spawn(async move {
+                if let Err(e) = store.index_analysis(&analysis_clone).await {
+                    eprintln!("Failed to index analysis to Elasticsearch: {}", e);
+                }
+            });
+        }
     }
 }
 
@@ -247,7 +384,7 @@ fn draw_analyses_tab(f: &mut Frame, app: &mut App, area: Rect) {
         .enumerate()
         .map(|(i, analysis)| {
             let severity = format!("{:?}", analysis.severity);
-            let content = format!("[{}] {} (Conf: {:.2})", severity, &analysis.explanation[..analysis.explanation.len().min(50)], analysis.confidence);
+            let content = format!("[{}] {} (Conf: {:.2})", severity, &analysis.summary[..analysis.summary.len().min(50)], analysis.confidence);
             ListItem::new(content).style(Style::default().fg(severity_color(&analysis.severity)))
         })
         .collect();
@@ -263,8 +400,8 @@ fn draw_analyses_tab(f: &mut Frame, app: &mut App, area: Rect) {
     let details = if let Some(i) = app.selected_analysis_details {
         if let Some(analysis) = app.analyses.get(i) {
             format!(
-                "Severity: {:?}\nExplanation: {}\nAction: {}\nConfidence: {:.2}",
-                analysis.severity, analysis.explanation, analysis.recommended_action, analysis.confidence
+                "Severity: {:?}\nSummary: {}\nDetails: {}\nConfidence: {:.2}",
+                analysis.severity, analysis.summary, analysis.details.as_ref().unwrap_or(&"None".to_string()), analysis.confidence
             )
         } else {
             "No analysis selected".to_string()
@@ -414,9 +551,29 @@ async fn event_handler(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    color_eyre::install()?;
+    // Initialize error handling (ignore errors to prevent TUI corruption)
+    let _ = color_eyre::install();
 
-    // Setup terminal
+    // Reset terminal state in case a previous TUI session crashed
+    let _ = disable_raw_mode();
+    let mut stdout = std::io::stdout();
+    let _ = execute!(stdout, LeaveAlternateScreen, Show);
+
+    // Initialize app
+    let app = Arc::new(Mutex::new(App::new().await));
+
+    // Spawn API server (silently handle errors to avoid TUI corruption)
+    let shared_app = Arc::clone(&app);
+    let api_server = tokio::spawn(async move {
+        // Try to bind to port 3000, but don't panic if it fails
+        if let Ok(listener) = tokio::net::TcpListener::bind("0.0.0.0:3000").await {
+            let router = create_router(shared_app);
+            let _ = axum::serve(listener, router).await; // Ignore errors
+        }
+        // If binding fails, just continue without API server
+    });
+
+    // Setup terminal (suppress all error output to avoid TUI corruption)
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -425,31 +582,66 @@ async fn main() -> Result<()> {
 
     // Create channels
     let (event_tx, event_rx) = mpsc::channel(100);
-    let (alert_tx, mut alert_rx) = mpsc::channel(100);
-    let (analysis_tx, mut analysis_rx) = mpsc::channel(100);
-
-    // Initialize app
-    let app = Arc::new(Mutex::new(App::default()));
+    let (alert_tx, alert_rx) = mpsc::channel(100);
+    let (analysis_tx, analysis_rx) = mpsc::channel(100);
 
     // Spawn event handler
     let event_handler = tokio::spawn(async move {
         event_handler(event_rx, alert_tx, analysis_tx).await
     });
 
+    // Spawn signal handler for clean shutdown
+    let signal_event_tx = event_tx.clone();
+    let signal_handler = tokio::spawn(async move {
+        // Wait for SIGINT (Ctrl+C) - no debug output during normal operation
+        let _ = signal::ctrl_c().await;
+
+        // Send quit signal to the event loop
+        let _ = signal_event_tx.send(AppEvent::Quit).await;
+    });
+
     // Run app
     let res = run_app(&mut terminal, Arc::clone(&app), event_tx.clone(), alert_rx, analysis_rx).await;
 
-    // Cleanup
-    event_tx.send(AppEvent::Quit).await?;
-    event_handler.abort();
+    // Clean shutdown sequence - restore terminal first to show messages
+    disable_raw_mode().ok();
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture).ok();
+    terminal.show_cursor().ok();
 
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
-    terminal.show_cursor()?;
+    println!("Starting clean shutdown...");
 
-    if let Err(err) = res {
-        println!("{:?}", err);
+    // 1. Send quit signal to event handler (if not already sent by signal handler)
+    let _ = event_tx.send(AppEvent::Quit).await;
+
+    // 2. Wait for event handler to finish gracefully with timeout
+    let shutdown_timeout = tokio::time::Duration::from_secs(5);
+    match tokio::time::timeout(shutdown_timeout, event_handler).await {
+        Ok(result) => {
+            if let Err(e) = result {
+                println!("Event handler finished with error: {:?}", e);
+            } else {
+                println!("Event handler shut down gracefully");
+            }
+        }
+        Err(_) => {
+            println!("Event handler shutdown timed out, forcing abort");
+            // The task will be aborted below anyway
+        }
     }
 
+    // 3. Abort API server (Axum doesn't have graceful shutdown in this version easily)
+    api_server.abort();
+    println!("API server aborted");
+
+    // 4. Abort signal handler
+    signal_handler.abort();
+
+    // 5. Report any errors from the main app loop
+    if let Err(err) = res {
+        println!("Application exited with error: {:?}", err);
+        return Err(err);
+    }
+
+    println!("Clean shutdown completed");
     Ok(())
 }

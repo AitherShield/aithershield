@@ -2,6 +2,8 @@ use serde_json::Value;
 use std::collections::HashMap;
 use thiserror::Error;
 
+pub mod elasticsearch;
+
 #[derive(Error, Debug)]
 pub enum StorageError {
     #[error("Serialization error: {0}")]

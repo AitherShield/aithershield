@@ -116,16 +116,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match analyzer.analyze_log(&log).await {
             Ok(result) => {
                 println!("Severity: {:?} (Confidence: {:.2})", result.severity, result.confidence);
-                println!("Explanation: {}", result.explanation);
-                println!("Recommended Action: {}", result.recommended_action);
+                println!("Summary: {}", result.summary);
+                println!("Details: {}", result.details.as_deref().unwrap_or("None"));
+                println!("Related Alerts: {:?}", result.related_alerts);
 
                 // Check for alerting
                 if result.severity >= alert_min_severity || (result.severity == LogSeverity::Medium && result.confidence < 0.5) {
                     let alert = alerting::Alert::new(
                         log.clone(),
                         result.severity.clone(),
-                        result.explanation.clone(),
-                        result.recommended_action.clone(),
+                        result.summary.clone(),
+                        "Review and investigate".to_string(),
                         result.confidence,
                     );
                     if let Err(e) = alerting::trigger_alert(&alert, &analyzer.alert_channels, &mut alert_manager).await {
