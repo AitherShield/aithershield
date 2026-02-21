@@ -1,4 +1,4 @@
-use aithershield::{LlmBackend, OllamaBackend, GrokApiBackend, SiemAnalyzer, GenerateOptions, ChatMessage, Role, ingestion, storage};
+use aithershield::{LlmBackend, OllamaBackend, GrokApiBackend, SiemAnalyzer, GenerateOptions, ChatMessage, Role, LogSeverity, ingestion, storage, alerting};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -85,10 +85,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => println!("Chroma not available ({}), proceeding without RAG.", e),
     }
 
+    // Configure alerting
+    let alert_min_severity = std::env::var("ALERT_MIN_SEVERITY")
+        .unwrap_or_else(|_| "High".to_string())
+        .parse::<aithershield::LogSeverity>()
+        .unwrap_or(aithershield::LogSeverity::High);
+    let alert_channels_str = std::env::var("ALERT_CHANNELS").unwrap_or_else(|_| "console".to_string());
+    let alert_file_path = std::env::var("ALERT_FILE_PATH").unwrap_or_else(|_| "./alerts.log".to_string());
+    let mut alert_channels = Vec::new();
+    for channel in alert_channels_str.split(',') {
+        match channel.trim() {
+            "console" => alert_channels.push(aithershield::alerting::AlertChannel::Console),
+            "file" => alert_channels.push(aithershield::alerting::AlertChannel::File(alert_file_path.clone())),
+            _ => {}
+        }
+    }
+    analyzer = analyzer.with_alerting(alert_min_severity.clone(), alert_channels);
+
+    let mut alert_manager = alerting::AlertManager::default();
+
     let sample_logs = vec![
         "Feb 20 14:30:15 server sshd[1234]: Failed password for invalid user admin from 192.168.1.100 port 22 ssh2".to_string(),
         "Feb 20 14:31:00 server kernel: [ 1234.567890] CPU0: Core temperature above threshold, running at 95 C".to_string(),
         "Feb 20 14:32:10 server sudo: user1 : TTY=pts/0 ; PWD=/home/user1 ; USER=root ; COMMAND=/bin/bash".to_string(),
+        "Feb 20 14:33:00 server auth: Multiple failed login attempts from 192.168.1.100, possible brute force attack".to_string(), // High severity
     ];
 
     for log in sample_logs {
@@ -98,6 +118,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Severity: {:?} (Confidence: {:.2})", result.severity, result.confidence);
                 println!("Explanation: {}", result.explanation);
                 println!("Recommended Action: {}", result.recommended_action);
+
+                // Check for alerting
+                if result.severity >= alert_min_severity || (result.severity == LogSeverity::Medium && result.confidence < 0.5) {
+                    let alert = alerting::Alert::new(
+                        log.clone(),
+                        result.severity.clone(),
+                        result.explanation.clone(),
+                        result.recommended_action.clone(),
+                        result.confidence,
+                    );
+                    if let Err(e) = alerting::trigger_alert(&alert, &analyzer.alert_channels, &mut alert_manager).await {
+                        eprintln!("Alert error: {}", e);
+                    }
+                }
             }
             Err(e) => println!("Analysis Error: {}", e),
         }

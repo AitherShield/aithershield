@@ -2,8 +2,10 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::str::FromStr;
 use thiserror::Error;
 
+pub mod alerting;
 pub mod ingestion;
 pub mod storage;
 
@@ -400,13 +402,38 @@ impl LlmBackend for GrokApiBackend {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, PartialOrd)]
 #[serde(rename_all = "lowercase")]
 pub enum LogSeverity {
     Low,
     Medium,
     High,
     Critical,
+}
+
+impl fmt::Display for LogSeverity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LogSeverity::Low => write!(f, "Low"),
+            LogSeverity::Medium => write!(f, "Medium"),
+            LogSeverity::High => write!(f, "High"),
+            LogSeverity::Critical => write!(f, "Critical"),
+        }
+    }
+}
+
+impl FromStr for LogSeverity {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "low" => Ok(LogSeverity::Low),
+            "medium" => Ok(LogSeverity::Medium),
+            "high" => Ok(LogSeverity::High),
+            "critical" => Ok(LogSeverity::Critical),
+            _ => Err(format!("Unknown severity: {}", s)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -425,6 +452,8 @@ pub struct SiemAnalyzer {
     confidence_threshold: f32,
     chroma_store: Option<storage::ChromaStore>,
     embedding_model: String,
+    pub alert_min_severity: LogSeverity,
+    pub alert_channels: Vec<alerting::AlertChannel>,
 }
 
 impl SiemAnalyzer {
@@ -437,6 +466,8 @@ impl SiemAnalyzer {
             confidence_threshold: 0.7,
             chroma_store: None,
             embedding_model: "nomic-embed-text".to_string(),
+            alert_min_severity: LogSeverity::High,
+            alert_channels: vec![alerting::AlertChannel::Console],
         }
     }
 
@@ -458,6 +489,12 @@ impl SiemAnalyzer {
 
     pub fn with_embedding_model(mut self, model: String) -> Self {
         self.embedding_model = model;
+        self
+    }
+
+    pub fn with_alerting(mut self, min_severity: LogSeverity, channels: Vec<alerting::AlertChannel>) -> Self {
+        self.alert_min_severity = min_severity;
+        self.alert_channels = channels;
         self
     }
 
@@ -537,23 +574,43 @@ impl SiemAnalyzer {
         Ok(result)
     }
 
-    pub async fn analyze_logs_batch(&self, log_entries: Vec<String>) -> Result<Vec<AnalysisResult>, LlmError> {
+    pub async fn analyze_logs_batch(&self, log_entries: Vec<String>, alert_manager: Option<&mut alerting::AlertManager>) -> Result<Vec<AnalysisResult>, LlmError> {
         let mut results = Vec::new();
         for log in log_entries {
             let result = self.analyze_log(&log).await?;
             results.push(result);
         }
+
+        // Check for alerting after all analysis
+        if let Some(manager) = alert_manager {
+            for result in &results {
+                if result.severity >= self.alert_min_severity || (result.severity == LogSeverity::Medium && result.confidence < 0.5) {
+                    let alert = alerting::Alert::new(
+                        // We don't have the original log here, so use explanation as id
+                        result.explanation.clone(),
+                        result.severity.clone(),
+                        result.explanation.clone(),
+                        result.recommended_action.clone(),
+                        result.confidence,
+                    );
+                    if let Err(e) = alerting::trigger_alert(&alert, &self.alert_channels, manager).await {
+                        eprintln!("Alert error: {}", e);
+                    }
+                }
+            }
+        }
+
         Ok(results)
     }
 
-    pub async fn process_log_file(&self, file_path: &str) -> Result<Vec<AnalysisResult>, LlmError> {
+    pub async fn process_log_file(&self, file_path: &str, alert_manager: Option<&mut alerting::AlertManager>) -> Result<Vec<AnalysisResult>, LlmError> {
         let log_entries = ingestion::ingest_logs(file_path)
             .await
             .map_err(|e| LlmError::Other(anyhow::anyhow!("Ingestion error: {}", e)))?;
 
         let raw_logs: Vec<String> = log_entries.into_iter().map(|e| e.raw).collect();
 
-        self.analyze_logs_batch(raw_logs).await
+        self.analyze_logs_batch(raw_logs, alert_manager).await
     }
 }
 
@@ -577,9 +634,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_anonymize_log_masks_ipv6() {
-        let log = "Connection from 2001:0db8:85a3:0000:0000:8a2e:0370:7334";
+        let log = "Connect from 2001:0db8:85a3:0000:0000:8a2e:0370:7334";
         let (result, masked) = ingestion::anonymize_log(log);
-        assert_eq!(result, "Connection from [IPV6]");
+        assert_eq!(result, "Connect from [IPV6]");
     }
 
     #[tokio::test]
@@ -663,7 +720,7 @@ mod tests {
         let backend = OllamaBackend::new(mock_server.uri());
         let analyzer = SiemAnalyzer::new(Box::new(backend), "test-model".to_string());
 
-        let results = analyzer.process_log_file(temp_file).await.unwrap();
+        let results = analyzer.process_log_file(temp_file, None).await.unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].severity, LogSeverity::Medium);
 

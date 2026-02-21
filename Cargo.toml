@@ -16,6 +16,11 @@ wiremock = "0.6"
 proptest = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.0", features = ["v4"] }
+colored = "2.0"
+ratatui = "0.26"
+crossterm = { version = "0.27", features = ["event-stream"] }
+color-eyre = "0.6"
+futures = "0.3"
 chroma = { version = "0.13", default-features = false, features = ["rustls"], optional = true }
 
 [features]
@@ -27,3 +32,7 @@ real-chroma = ["dep:chroma"]
 [[bin]]
 name = "aithershield"
 path = "src/main.rs"
+
+[[bin]]
+name = "tui"
+path = "src/bin/tui.rs"
