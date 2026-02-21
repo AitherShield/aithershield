@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use thiserror::Error;
 
 pub mod elasticsearch;
+pub mod es_store;
 
 #[derive(Error, Debug)]
 pub enum StorageError {

@@ -150,7 +150,7 @@ enum AppEvent {
 struct App {
     alerts: Vec<Alert>,
     analyses: Vec<AnalysisResult>,
-    es_store: Option<storage::elasticsearch::EsStore>,
+    es_store: Option<storage::es_store::EsStore>,
     tab: Tab,
     alert_list_state: ListState,
     analysis_list_state: ListState,
@@ -179,20 +179,25 @@ impl App {
 
         // Try to connect to Elasticsearch and load recent data
         if let Ok(es_url) = std::env::var("ELASTICSEARCH_URL") {
-            match storage::elasticsearch::EsStore::new(&es_url).await {
-                Ok(store) => {
-                    app.es_store = Some(store);
-                    app.status_info = format!("Connected to Elasticsearch at {}", es_url);
+            match storage::es_store::EsStore::new(Some(&es_url)).await {
+                Ok(mut store) => {
+                    // Ensure indices exist
+                    if let Err(e) = store.ensure_indices().await {
+                        app.status_info = format!("ES indices failed: {}", e);
+                    } else {
+                        app.es_store = Some(store);
+                        app.status_info = format!("Connected to ES at {}", es_url);
 
-                    // Load recent alerts and analyses
-                    if let Ok(alerts) = app.es_store.as_ref().unwrap().query_recent_alerts(100, None).await {
-                        app.alerts = alerts;
-                        app.status_info = format!("Loaded {} alerts from ES", app.alerts.len());
-                    }
+                        // Load recent alerts and analyses (last 24 hours)
+                        if let Ok(alerts) = app.es_store.as_ref().unwrap().get_recent_alerts(24).await {
+                            app.alerts = alerts;
+                            app.status_info = format!("Loaded {} alerts from ES", app.alerts.len());
+                        }
 
-                    if let Ok(analyses) = app.es_store.as_ref().unwrap().query_recent_analyses(100, None).await {
-                        app.analyses = analyses;
-                        app.status_info = format!("Loaded {} alerts, {} analyses from ES", app.alerts.len(), app.analyses.len());
+                        if let Ok(analyses) = app.es_store.as_ref().unwrap().get_recent_analyses(24).await {
+                            app.analyses = analyses;
+                            app.status_info = format!("Loaded {} alerts, {} analyses from ES", app.alerts.len(), app.analyses.len());
+                        }
                     }
                 }
                 Err(e) => {

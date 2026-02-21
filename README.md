@@ -44,7 +44,7 @@ AitherShield supports various environment variables for configuration:
 - `ALERT_FILE_PATH` - File path for file-based alerts (default: `./alerts.log`)
 
 ### Persistence
-- `ELASTICSEARCH_URL` - URL for Elasticsearch instance (enables persistent storage)
+- `ELASTICSEARCH_URL` - URL for Elasticsearch instance (default: `http://elasticsearch:9200`, enables persistent storage)
 
 ## Usage Examples
 
@@ -120,6 +120,34 @@ Analyzes log entries. Expects JSON payload:
 }
 ```
 Returns analysis result with severity, summary, and confidence score.
+
+### Elasticsearch Features
+
+When Elasticsearch is configured, AitherShield provides:
+
+- **Automatic Index Creation**: Indices `aithershield-alerts` and `aithershield-analyses` are created with proper mappings
+- **Persistent Storage**: All alerts and analyses are indexed for durability
+- **Startup Loading**: Recent data (last 24 hours) is loaded on application startup
+- **Fallback Mode**: If Elasticsearch is unavailable, the system continues with in-memory storage only
+
+#### Query Examples (Programmatic)
+
+```rust
+use aithershield::storage::es_store::{EsStore, EsQuery};
+use aithershield::LogSeverity;
+
+// Get recent alerts (last 24 hours)
+let alerts = store.get_recent_alerts(24).await?;
+
+// Custom query with filters
+let query = EsQuery::new()
+    .limit(50)
+    .min_severity(LogSeverity::High)
+    .last_hours(168)  // Last 7 days
+    .sort_desc();
+
+let high_severity_alerts = store.query_alerts(query).await?;
+```
 
 ### Example API Usage
 ```bash

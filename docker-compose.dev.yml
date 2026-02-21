@@ -56,6 +56,35 @@ services:
             timeout: 10s
             retries: 5
 
+    kibana:
+        image: docker.elastic.co/kibana/kibana:8.15.3 # match ES version
+        container_name: aithershield-kibana
+        restart: unless-stopped
+        ports:
+            - "0.0.0.0:5601:5601" # Kibana web UI - bind to all interfaces for LAN access
+        environment:
+            - SERVER_HOST=0.0.0.0 # bind to all interfaces
+            - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+            # Security disabled for dev (enable in prod)
+            - XPACK_SECURITY_ENABLED=false
+            - XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY=your-encryption-key-here-at-least-32-chars
+            - XPACK_REPORTING_ENCRYPTIONKEY=your-reporting-encryption-key-here-at-least-32-chars
+            # Optional: default username/password (only if security enabled)
+            # - ELASTICSEARCH_USERNAME=kibana_system
+            # - ELASTICSEARCH_PASSWORD=your-password
+        depends_on:
+            elasticsearch:
+                condition: service_healthy
+        healthcheck:
+            test:
+                [
+                    "CMD-SHELL",
+                    "curl -s -f http://localhost:5601/api/status",
+                ]
+            interval: 30s
+            timeout: 10s
+            retries: 5
+
     chroma:
         image: ghcr.io/chroma-core/chroma:latest
         container_name: aithershield-chroma
