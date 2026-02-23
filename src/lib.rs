@@ -5,10 +5,32 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 use thiserror::Error;
+use tokio::sync::broadcast;
 
 pub mod alerting;
 pub mod ingestion;
 pub mod storage;
+
+#[derive(Clone, Serialize, Debug)]
+pub struct PipelineEvent {
+    pub event_id: uuid::Uuid,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    pub stage: String,
+    pub status: PipelineStatus,
+    pub log_snippet: String,
+    pub model: Option<String>,
+    pub latency_ms: Option<u64>,
+    pub confidence: Option<f32>,
+    pub next_stage: Option<String>,
+}
+
+#[derive(Clone, Serialize, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum PipelineStatus {
+    Started,
+    Completed,
+    Error,
+}
 
 #[derive(Error, Debug)]
 pub enum LlmError {
@@ -522,29 +544,149 @@ impl SiemAnalyzer {
         Ok(parsed)
     }
 
-    pub async fn analyze_log(&self, log_entry: &str) -> Result<AnalysisResult, LlmError> {
-        let (sanitized, _) = ingestion::anonymize_log(log_entry);
+    pub async fn analyze_log_with_events(&self, log_entry: &str, event_tx: Option<&broadcast::Sender<PipelineEvent>>) -> Result<AnalysisResult, LlmError> {
+        let log_snippet = log_entry.chars().take(100).collect::<String>();
 
-        // Retrieve context if Chroma is available
+        // Input stage
+        if let Some(tx) = event_tx {
+            let event = PipelineEvent {
+                event_id: uuid::Uuid::new_v4(),
+                timestamp: chrono::Utc::now(),
+                stage: "Input.Syslog".to_string(),
+                status: PipelineStatus::Started,
+                log_snippet: log_snippet.clone(),
+                model: None,
+                latency_ms: None,
+                confidence: None,
+                next_stage: Some("Anonymizer".to_string()),
+            };
+            let _ = tx.send(event);
+        }
+
+        let start_time = std::time::Instant::now();
+        let (sanitized, masked) = ingestion::anonymize_log(log_entry);
+        let anonymize_latency = start_time.elapsed().as_millis() as u64;
+
+        if let Some(tx) = event_tx {
+            let event = PipelineEvent {
+                event_id: uuid::Uuid::new_v4(),
+                timestamp: chrono::Utc::now(),
+                stage: "Anonymizer".to_string(),
+                status: PipelineStatus::Completed,
+                log_snippet: sanitized.chars().take(100).collect(),
+                model: None,
+                latency_ms: Some(anonymize_latency),
+                confidence: None,
+                next_stage: Some("Embedder".to_string()),
+            };
+            let _ = tx.send(event);
+        }
+
+        // Embedding stage
+        let embed_start = std::time::Instant::now();
         let retrieved_contexts = if let Some(store) = &self.chroma_store {
-            let query_embedding = self.backend.embed(&sanitized, &self.embedding_model).await?;
-            store.retrieve_context(query_embedding, 3, 0.7).await
-                .map_err(|e| LlmError::Other(anyhow::anyhow!("Storage error: {}", e)))?
+            match self.backend.embed(&sanitized, &self.embedding_model).await {
+                Ok(query_embedding) => {
+                    let embed_latency = embed_start.elapsed().as_millis() as u64;
+                    if let Some(tx) = event_tx {
+                        let event = PipelineEvent {
+                            event_id: uuid::Uuid::new_v4(),
+                            timestamp: chrono::Utc::now(),
+                            stage: "Embedder".to_string(),
+                            status: PipelineStatus::Completed,
+                            log_snippet: log_snippet.clone(),
+                            model: Some(self.embedding_model.clone()),
+                            latency_ms: Some(embed_latency),
+                            confidence: None,
+                            next_stage: Some("Chroma.RAG".to_string()),
+                        };
+                        let _ = tx.send(event);
+                    }
+                    store.retrieve_context(query_embedding, 3, 0.7).await
+                        .map_err(|e| LlmError::Other(anyhow::anyhow!("Storage error: {}", e)))?
+                }
+                Err(e) => {
+                    if let Some(tx) = event_tx {
+                        let event = PipelineEvent {
+                            event_id: uuid::Uuid::new_v4(),
+                            timestamp: chrono::Utc::now(),
+                            stage: "Embedder".to_string(),
+                            status: PipelineStatus::Error,
+                            log_snippet: log_snippet.clone(),
+                            model: Some(self.embedding_model.clone()),
+                            latency_ms: Some(embed_start.elapsed().as_millis() as u64),
+                            confidence: None,
+                            next_stage: None,
+                        };
+                        let _ = tx.send(event);
+                    }
+                    return Err(e);
+                }
+            }
         } else {
             Vec::new()
         };
 
-        // First try with primary backend (Ollama)
+        if let Some(tx) = event_tx {
+            let event = PipelineEvent {
+                event_id: uuid::Uuid::new_v4(),
+                timestamp: chrono::Utc::now(),
+                stage: "Chroma.RAG".to_string(),
+                status: PipelineStatus::Completed,
+                log_snippet: log_snippet.clone(),
+                model: None,
+                latency_ms: None,
+                confidence: None,
+                next_stage: Some("Ollama.Triage".to_string()),
+            };
+            let _ = tx.send(event);
+        }
+
+        // Triage stage
+        let triage_start = std::time::Instant::now();
         let mut result = self.analyze_with_backend(
             self.backend.as_ref(),
             &self.model,
             &sanitized,
             &retrieved_contexts,
         ).await?;
+        let triage_latency = triage_start.elapsed().as_millis() as u64;
 
-        // If confidence is below threshold and Grok is available, try with Grok
+        if let Some(tx) = event_tx {
+            let event = PipelineEvent {
+                event_id: uuid::Uuid::new_v4(),
+                timestamp: chrono::Utc::now(),
+                stage: "Ollama.Triage".to_string(),
+                status: PipelineStatus::Completed,
+                log_snippet: log_snippet.clone(),
+                model: Some(self.model.clone()),
+                latency_ms: Some(triage_latency),
+                confidence: Some(result.confidence),
+                next_stage: Some("ConfidenceRouter".to_string()),
+            };
+            let _ = tx.send(event);
+        }
+
+        // Confidence Router
         if result.confidence < self.confidence_threshold {
+            if let Some(tx) = event_tx {
+                let event = PipelineEvent {
+                    event_id: uuid::Uuid::new_v4(),
+                    timestamp: chrono::Utc::now(),
+                    stage: "ConfidenceRouter".to_string(),
+                    status: PipelineStatus::Completed,
+                    log_snippet: log_snippet.clone(),
+                    model: None,
+                    latency_ms: None,
+                    confidence: Some(result.confidence),
+                    next_stage: Some("Grok.Fallback".to_string()),
+                };
+                let _ = tx.send(event);
+            }
+
+            // Grok Fallback
             if let (Some(grok_backend), Some(grok_model)) = (&self.grok_backend, &self.grok_model) {
+                let grok_start = std::time::Instant::now();
                 match self.analyze_with_backend(
                     grok_backend.as_ref(),
                     grok_model,
@@ -552,18 +694,92 @@ impl SiemAnalyzer {
                     &retrieved_contexts,
                 ).await {
                     Ok(grok_result) => {
+                        let grok_latency = grok_start.elapsed().as_millis() as u64;
                         if grok_result.confidence > result.confidence {
                             result = grok_result;
+                            if let Some(tx) = event_tx {
+                                let event = PipelineEvent {
+                                    event_id: uuid::Uuid::new_v4(),
+                                    timestamp: chrono::Utc::now(),
+                                    stage: "Grok.Fallback".to_string(),
+                                    status: PipelineStatus::Completed,
+                                    log_snippet: log_snippet.clone(),
+                                    model: Some(grok_model.clone()),
+                                    latency_ms: Some(grok_latency),
+                                    confidence: Some(result.confidence),
+                                    next_stage: Some("AlertGenerator".to_string()),
+                                };
+                                let _ = tx.send(event);
+                            }
+                        } else {
+                            if let Some(tx) = event_tx {
+                                let event = PipelineEvent {
+                                    event_id: uuid::Uuid::new_v4(),
+                                    timestamp: chrono::Utc::now(),
+                                    stage: "Grok.Fallback".to_string(),
+                                    status: PipelineStatus::Completed,
+                                    log_snippet: log_snippet.clone(),
+                                    model: Some(grok_model.clone()),
+                                    latency_ms: Some(grok_latency),
+                                    confidence: Some(grok_result.confidence),
+                                    next_stage: Some("AlertGenerator".to_string()),
+                                };
+                                let _ = tx.send(event);
+                            }
                         }
                     }
                     Err(_) => {
-                        // If Grok fails, keep the original result
+                        if let Some(tx) = event_tx {
+                            let event = PipelineEvent {
+                                event_id: uuid::Uuid::new_v4(),
+                                timestamp: chrono::Utc::now(),
+                                stage: "Grok.Fallback".to_string(),
+                                status: PipelineStatus::Error,
+                                log_snippet: log_snippet.clone(),
+                                model: Some(grok_model.clone()),
+                                latency_ms: Some(grok_start.elapsed().as_millis() as u64),
+                                confidence: None,
+                                next_stage: Some("AlertGenerator".to_string()),
+                            };
+                            let _ = tx.send(event);
+                        }
                     }
                 }
             }
+        } else {
+            if let Some(tx) = event_tx {
+                let event = PipelineEvent {
+                    event_id: uuid::Uuid::new_v4(),
+                    timestamp: chrono::Utc::now(),
+                    stage: "ConfidenceRouter".to_string(),
+                    status: PipelineStatus::Completed,
+                    log_snippet: log_snippet.clone(),
+                    model: None,
+                    latency_ms: None,
+                    confidence: Some(result.confidence),
+                    next_stage: Some("AlertGenerator".to_string()),
+                };
+                let _ = tx.send(event);
+            }
         }
 
-        // Store the analysis if Chroma is available
+        // Alert Generator
+        if let Some(tx) = event_tx {
+            let event = PipelineEvent {
+                event_id: uuid::Uuid::new_v4(),
+                timestamp: chrono::Utc::now(),
+                stage: "AlertGenerator".to_string(),
+                status: PipelineStatus::Completed,
+                log_snippet: log_snippet.clone(),
+                model: None,
+                latency_ms: None,
+                confidence: Some(result.confidence),
+                next_stage: Some("Storage".to_string()),
+            };
+            let _ = tx.send(event);
+        }
+
+        // Storage
         if let Some(store) = &self.chroma_store {
             let embedding = self.backend.embed(&sanitized, &self.embedding_model).await?;
             let id = uuid::Uuid::new_v4().to_string();
@@ -575,7 +791,26 @@ impl SiemAnalyzer {
                 .map_err(|e| LlmError::Other(anyhow::anyhow!("Storage error: {}", e)))?;
         }
 
+        if let Some(tx) = event_tx {
+            let event = PipelineEvent {
+                event_id: uuid::Uuid::new_v4(),
+                timestamp: chrono::Utc::now(),
+                stage: "Storage".to_string(),
+                status: PipelineStatus::Completed,
+                log_snippet: log_snippet.clone(),
+                model: None,
+                latency_ms: None,
+                confidence: None,
+                next_stage: None,
+            };
+            let _ = tx.send(event);
+        }
+
         Ok(result)
+    }
+
+    pub async fn analyze_log(&self, log_entry: &str) -> Result<AnalysisResult, LlmError> {
+        self.analyze_log_with_events(log_entry, None).await
     }
 
     pub async fn analyze_logs_batch(&self, log_entries: Vec<String>, alert_manager: Option<&mut alerting::AlertManager>) -> Result<Vec<AnalysisResult>, LlmError> {

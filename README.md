@@ -5,8 +5,8 @@ AitherShield is an AI-powered Security Information and Event Management (SIEM) s
 - **Real-time log analysis** using Ollama and Grok AI backends
 - **Vector-based context retrieval** with Chroma for enhanced analysis
 - **Persistent storage** with Elasticsearch for durability
-- **Terminal UI** for interactive monitoring
-- **REST API** for integration with other systems
+- **Tauri desktop client** for interactive monitoring and dataflow visualization
+- **REST API** with WebSocket events for integration and real-time updates
 - **Intelligent alerting** with configurable severity thresholds
 
 ## Quick Start
@@ -16,15 +16,15 @@ AitherShield is an AI-powered Security Information and Event Management (SIEM) s
    ollama pull qwen2.5:14b-instruct-q5_K_M
    ```
 
-2. **Run basic analysis**:
+2. **Run the API server**:
    ```bash
-   cargo run
+   cargo run --bin api
    ```
 
 3. **Enable persistence** (optional):
    ```bash
    export ELASTICSEARCH_URL="http://localhost:9200"
-   cargo run --bin tui
+   cargo run --bin api
    ```
 
 ## Environment Variables
@@ -48,31 +48,25 @@ AitherShield supports various environment variables for configuration:
 
 ## Usage Examples
 
-### Basic Usage (Ollama only)
+### API Server Mode
 ```bash
-cargo run
+cargo run --bin api
 ```
 
 ### With AI Confidence Routing
 ```bash
 export XAI_OPENAI_KEY="your-api-key"
 export GROK_CONFIDENCE_THRESHOLD=0.7
-cargo run
+cargo run --bin api
 ```
 
 ### With Vector Database (RAG)
 ```bash
 export CHROMA_URL="http://localhost:8000"
-cargo run
+cargo run --bin api
 ```
 
 ### With Elasticsearch Persistence
-```bash
-export ELASTICSEARCH_URL="http://localhost:9200"
-cargo run --bin tui
-```
-
-### API Server Mode
 ```bash
 export ELASTICSEARCH_URL="http://localhost:9200"
 cargo run --bin api
@@ -87,13 +81,23 @@ export ELASTICSEARCH_URL="http://localhost:9200"
 export ALERT_MIN_SEVERITY="Medium"
 export ALERT_CHANNELS="console,file"
 export ALERT_FILE_PATH="/var/log/aithershield/alerts.log"
-cargo run --bin tui
+export API_KEY="your-secret-api-key"
+cargo run --bin api
 ```
 
 ### Testing
 ```bash
 cargo test --features mock-chroma
 ```
+
+## Tauri Desktop Client
+
+The primary user interface is the Tauri-based desktop client (AitherShield-client repository):
+
+- **Real-time Dashboard**: Live metrics and alert monitoring
+- **Dataflow Visualization**: NiFi-style interactive pipeline monitoring via WebSocket
+- **Secure Settings**: Encrypted configuration storage
+- **WebSocket Integration**: Real-time pipeline events and alerts
 
 ## API Endpoints
 
@@ -120,6 +124,12 @@ Analyzes log entries. Expects JSON payload:
 }
 ```
 Returns analysis result with severity, summary, and confidence score.
+
+### GET `/ws/pipeline-events`
+WebSocket endpoint for real-time pipeline event streaming. Requires authentication via `?api_key=xxx` or `Authorization: Bearer xxx` header. Provides live dataflow visualization events.
+
+### POST `/pipeline/test`
+Triggers a full pipeline test flow and broadcasts events via WebSocket. Useful for testing the dataflow visualization.
 
 ### Elasticsearch Features
 
@@ -161,4 +171,10 @@ curl http://localhost:3000/alerts
 curl -X POST http://localhost:3000/analyze \
   -H "Content-Type: application/json" \
   -d '{"logs": "Failed password for user admin from 192.168.1.100"}'
+
+# Test pipeline flow (triggers WebSocket events)
+curl -X POST http://localhost:3000/pipeline/test
+
+# Connect to WebSocket for real-time events
+websocat ws://localhost:3000/ws/pipeline-events?api_key=your_key
 ```
