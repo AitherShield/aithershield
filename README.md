@@ -16,15 +16,15 @@ AitherShield is an AI-powered Security Information and Event Management (SIEM) s
    ollama pull qwen2.5:14b-instruct-q5_K_M
    ```
 
-2. **Run the API server**:
+2. **Run the server**:
    ```bash
-   cargo run --bin api
+   cargo run --bin server
    ```
 
 3. **Enable persistence** (optional):
    ```bash
    export ELASTICSEARCH_URL="http://localhost:9200"
-   cargo run --bin api
+   cargo run --bin server
    ```
 
 ## Environment Variables
@@ -48,28 +48,28 @@ AitherShield supports various environment variables for configuration:
 
 ## Usage Examples
 
-### API Server Mode
+### Server Mode
 ```bash
-cargo run --bin api
+cargo run --bin server
 ```
 
 ### With AI Confidence Routing
 ```bash
 export XAI_OPENAI_KEY="your-api-key"
 export GROK_CONFIDENCE_THRESHOLD=0.7
-cargo run --bin api
+cargo run --bin server
 ```
 
 ### With Vector Database (RAG)
 ```bash
 export CHROMA_URL="http://localhost:8000"
-cargo run --bin api
+cargo run --bin server
 ```
 
 ### With Elasticsearch Persistence
 ```bash
 export ELASTICSEARCH_URL="http://localhost:9200"
-cargo run --bin api
+cargo run --bin server
 ```
 
 ### Full Configuration Example
@@ -82,7 +82,7 @@ export ALERT_MIN_SEVERITY="Medium"
 export ALERT_CHANNELS="console,file"
 export ALERT_FILE_PATH="/var/log/aithershield/alerts.log"
 export API_KEY="your-secret-api-key"
-cargo run --bin api
+cargo run --bin server
 ```
 
 ### Testing
@@ -101,7 +101,7 @@ The primary user interface is the Tauri-based desktop client (AitherShield-clien
 
 ## API Endpoints
 
-When running the API server (`cargo run --bin api`), the following REST endpoints are available:
+When running the server (`cargo run --bin server`), the following REST endpoints are available:
 
 ### GET `/`
 Returns API information and available endpoints.

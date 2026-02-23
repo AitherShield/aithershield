@@ -1,4 +1,4 @@
-use aithershield::{alerting::Alert, LogSeverity, AnalysisResult, storage, SiemAnalyzer, OllamaBackend, GrokApiBackend, LlmBackend, PipelineEvent, PipelineStatus};
+use aithershield::{alerting::Alert, LogSeverity, AnalysisResult, storage, SiemAnalyzer, OllamaBackend, GrokApiBackend, PipelineEvent, PipelineStatus};
 use axum::{
     extract::{Query, State, WebSocketUpgrade},
     http::{HeaderMap, StatusCode},
@@ -6,11 +6,9 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
-use uuid::Uuid;
 use tokio::sync::broadcast;
 use futures_util::{SinkExt, StreamExt};
 
@@ -40,7 +38,25 @@ impl App {
     async fn new() -> Self {
         let now = std::time::Instant::now();
         let (pipeline_tx, _) = broadcast::channel(100);
-        let api_key = std::env::var("API_KEY").ok();
+
+        // Generate or use provided API key
+        let api_key = match std::env::var("API_KEY") {
+            Ok(key) => Some(key),
+            Err(_) => {
+                // Generate a random 32-character API key
+                use rand::{Rng, thread_rng};
+                use rand::distributions::Alphanumeric;
+                let key: String = thread_rng()
+                    .sample_iter(&Alphanumeric)
+                    .take(32)
+                    .map(char::from)
+                    .collect();
+                println!("🔑 Generated API Key: {}", key);
+                println!("   Copy this key to your Tauri client Settings > API Key");
+                println!("   Or set API_KEY environment variable to use a custom key");
+                Some(key)
+            }
+        };
         let mut app = Self {
             alerts: Vec::new(),
             analyses: Vec::new(),
@@ -55,7 +71,7 @@ impl App {
         // Try to connect to Elasticsearch and load recent data
         if let Ok(es_url) = std::env::var("ELASTICSEARCH_URL") {
             match storage::es_store::EsStore::new(Some(&es_url)).await {
-                Ok(mut store) => {
+                Ok(store) => {
                     // Ensure indices exist
                     if let Err(e) = store.ensure_indices().await {
                         eprintln!("Failed to ensure Elasticsearch indices: {}", e);
@@ -375,8 +391,20 @@ async fn handle_pipeline_events_socket(
 async fn main() {
     let app = Arc::new(Mutex::new(App::new().await));
 
-    let router = create_router(app);
+    let router = create_router(app.clone());
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    println!("API server listening on http://0.0.0.0:3000");
+    println!("🚀 AitherShield API server listening on http://0.0.0.0:3000");
+    println!("📡 WebSocket endpoint: ws://0.0.0.0:3000/ws/pipeline");
+
+    // Print API key info
+    {
+        let app_lock = app.lock().unwrap();
+        if let Some(ref key) = app_lock.api_key {
+            println!("🔐 API Key configured ({} characters)", key.len());
+        } else {
+            println!("⚠️  No API key configured - authentication disabled");
+        }
+    }
+
     axum::serve(listener, router).await.unwrap();
 }
