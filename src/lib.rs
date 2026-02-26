@@ -482,6 +482,60 @@ pub struct SiemAnalyzer {
     pub alert_channels: Vec<alerting::AlertChannel>,
 }
 
+/// Helper function to emit pipeline events through the broadcast channel
+/// 
+/// # Arguments
+/// * `tx` - Optional broadcast sender for pipeline events
+/// * `stage` - Stage name (e.g., "Input.Syslog", "Anonymizer", "Ollama.Triage")
+/// * `status` - Pipeline status (Started, Completed, Error)
+/// * `log_snippet` - First 100 chars of the log being processed
+/// * `model` - Optional model name that processed this stage
+/// * `latency_ms` - Optional processing time in milliseconds
+/// * `confidence` - Optional confidence score (0.0-1.0)
+/// * `next_stage` - Optional next stage in the pipeline
+fn emit_pipeline_event(
+    tx: &Option<&broadcast::Sender<PipelineEvent>>,
+    stage: &str,
+    status: PipelineStatus,
+    log_snippet: &str,
+    model: Option<String>,
+    latency_ms: Option<u64>,
+    confidence: Option<f32>,
+    next_stage: Option<&str>,
+) {
+    if let Some(tx) = tx {
+        let event = PipelineEvent {
+            event_id: uuid::Uuid::new_v4(),
+            timestamp: chrono::Utc::now(),
+            stage: stage.to_string(),
+            status,
+            log_snippet: log_snippet.to_string(),
+            model,
+            latency_ms,
+            confidence,
+            next_stage: next_stage.map(|s| s.to_string()),
+        };
+        
+        // Console logging for verification
+        let status_str = format!("{:?}", event.status);
+        match (event.latency_ms, event.confidence) {
+            (Some(lat), Some(conf)) => println!("📊 [{}] {} {} ({}ms, confidence: {:.2})", 
+                event.stage, status_str, 
+                event.model.as_deref().unwrap_or("-"), 
+                lat, conf),
+            (Some(lat), None) => println!("📊 [{}] {} {} ({}ms)", 
+                event.stage, status_str, 
+                event.model.as_deref().unwrap_or("-"), 
+                lat),
+            (None, Some(conf)) => println!("📊 [{}] {} (confidence: {:.2})", 
+                event.stage, status_str, conf),
+            (None, None) => println!("📊 [{}] {}", event.stage, status_str),
+        }
+        
+        let _ = tx.send(event);
+    }
+}
+
 impl SiemAnalyzer {
     pub fn new(backend: Box<dyn LlmBackend + Send + Sync>, model: String) -> Self {
         Self {
@@ -547,40 +601,34 @@ impl SiemAnalyzer {
     pub async fn analyze_log_with_events(&self, log_entry: &str, event_tx: Option<&broadcast::Sender<PipelineEvent>>) -> Result<AnalysisResult, LlmError> {
         let log_snippet = log_entry.chars().take(100).collect::<String>();
 
-        // Input stage
-        if let Some(tx) = event_tx {
-            let event = PipelineEvent {
-                event_id: uuid::Uuid::new_v4(),
-                timestamp: chrono::Utc::now(),
-                stage: "Input.Syslog".to_string(),
-                status: PipelineStatus::Started,
-                log_snippet: log_snippet.clone(),
-                model: None,
-                latency_ms: None,
-                confidence: None,
-                next_stage: Some("Anonymizer".to_string()),
-            };
-            let _ = tx.send(event);
-        }
+        // Input stage - Started
+        emit_pipeline_event(
+            &event_tx,
+            "Input.Syslog",
+            PipelineStatus::Started,
+            &log_snippet,
+            None,
+            None,
+            None,
+            Some("Anonymizer"),
+        );
 
         let start_time = std::time::Instant::now();
         let (sanitized, masked) = ingestion::anonymize_log(log_entry);
         let anonymize_latency = start_time.elapsed().as_millis() as u64;
 
-        if let Some(tx) = event_tx {
-            let event = PipelineEvent {
-                event_id: uuid::Uuid::new_v4(),
-                timestamp: chrono::Utc::now(),
-                stage: "Anonymizer".to_string(),
-                status: PipelineStatus::Completed,
-                log_snippet: sanitized.chars().take(100).collect(),
-                model: None,
-                latency_ms: Some(anonymize_latency),
-                confidence: None,
-                next_stage: Some("Embedder".to_string()),
-            };
-            let _ = tx.send(event);
-        }
+        // Anonymizer stage - Completed
+        let sanitized_snippet = sanitized.chars().take(100).collect::<String>();
+        emit_pipeline_event(
+            &event_tx,
+            "Anonymizer",
+            PipelineStatus::Completed,
+            &sanitized_snippet,
+            None,
+            Some(anonymize_latency),
+            None,
+            Some("Embedder"),
+        );
 
         // Embedding stage
         let embed_start = std::time::Instant::now();
@@ -588,38 +636,30 @@ impl SiemAnalyzer {
             match self.backend.embed(&sanitized, &self.embedding_model).await {
                 Ok(query_embedding) => {
                     let embed_latency = embed_start.elapsed().as_millis() as u64;
-                    if let Some(tx) = event_tx {
-                        let event = PipelineEvent {
-                            event_id: uuid::Uuid::new_v4(),
-                            timestamp: chrono::Utc::now(),
-                            stage: "Embedder".to_string(),
-                            status: PipelineStatus::Completed,
-                            log_snippet: log_snippet.clone(),
-                            model: Some(self.embedding_model.clone()),
-                            latency_ms: Some(embed_latency),
-                            confidence: None,
-                            next_stage: Some("Chroma.RAG".to_string()),
-                        };
-                        let _ = tx.send(event);
-                    }
+                    emit_pipeline_event(
+                        &event_tx,
+                        "Embedder",
+                        PipelineStatus::Completed,
+                        &sanitized_snippet,
+                        Some(self.embedding_model.clone()),
+                        Some(embed_latency),
+                        None,
+                        Some("Chroma.RAG"),
+                    );
                     store.retrieve_context(query_embedding, 3, 0.7).await
                         .map_err(|e| LlmError::Other(anyhow::anyhow!("Storage error: {}", e)))?
                 }
                 Err(e) => {
-                    if let Some(tx) = event_tx {
-                        let event = PipelineEvent {
-                            event_id: uuid::Uuid::new_v4(),
-                            timestamp: chrono::Utc::now(),
-                            stage: "Embedder".to_string(),
-                            status: PipelineStatus::Error,
-                            log_snippet: log_snippet.clone(),
-                            model: Some(self.embedding_model.clone()),
-                            latency_ms: Some(embed_start.elapsed().as_millis() as u64),
-                            confidence: None,
-                            next_stage: None,
-                        };
-                        let _ = tx.send(event);
-                    }
+                    emit_pipeline_event(
+                        &event_tx,
+                        "Embedder",
+                        PipelineStatus::Error,
+                        &sanitized_snippet,
+                        Some(self.embedding_model.clone()),
+                        Some(embed_start.elapsed().as_millis() as u64),
+                        None,
+                        None,
+                    );
                     return Err(e);
                 }
             }
@@ -627,20 +667,17 @@ impl SiemAnalyzer {
             Vec::new()
         };
 
-        if let Some(tx) = event_tx {
-            let event = PipelineEvent {
-                event_id: uuid::Uuid::new_v4(),
-                timestamp: chrono::Utc::now(),
-                stage: "Chroma.RAG".to_string(),
-                status: PipelineStatus::Completed,
-                log_snippet: log_snippet.clone(),
-                model: None,
-                latency_ms: None,
-                confidence: None,
-                next_stage: Some("Ollama.Triage".to_string()),
-            };
-            let _ = tx.send(event);
-        }
+        // Chroma RAG stage
+        emit_pipeline_event(
+            &event_tx,
+            "Chroma.RAG",
+            PipelineStatus::Completed,
+            &log_snippet,
+            None,
+            None,
+            None,
+            Some("Ollama.Triage"),
+        );
 
         // Triage stage
         let triage_start = std::time::Instant::now();
@@ -652,37 +689,29 @@ impl SiemAnalyzer {
         ).await?;
         let triage_latency = triage_start.elapsed().as_millis() as u64;
 
-        if let Some(tx) = event_tx {
-            let event = PipelineEvent {
-                event_id: uuid::Uuid::new_v4(),
-                timestamp: chrono::Utc::now(),
-                stage: "Ollama.Triage".to_string(),
-                status: PipelineStatus::Completed,
-                log_snippet: log_snippet.clone(),
-                model: Some(self.model.clone()),
-                latency_ms: Some(triage_latency),
-                confidence: Some(result.confidence),
-                next_stage: Some("ConfidenceRouter".to_string()),
-            };
-            let _ = tx.send(event);
-        }
+        emit_pipeline_event(
+            &event_tx,
+            "Ollama.Triage",
+            PipelineStatus::Completed,
+            &log_snippet,
+            Some(self.model.clone()),
+            Some(triage_latency),
+            Some(result.confidence),
+            Some("ConfidenceRouter"),
+        );
 
         // Confidence Router
         if result.confidence < self.confidence_threshold {
-            if let Some(tx) = event_tx {
-                let event = PipelineEvent {
-                    event_id: uuid::Uuid::new_v4(),
-                    timestamp: chrono::Utc::now(),
-                    stage: "ConfidenceRouter".to_string(),
-                    status: PipelineStatus::Completed,
-                    log_snippet: log_snippet.clone(),
-                    model: None,
-                    latency_ms: None,
-                    confidence: Some(result.confidence),
-                    next_stage: Some("Grok.Fallback".to_string()),
-                };
-                let _ = tx.send(event);
-            }
+            emit_pipeline_event(
+                &event_tx,
+                "ConfidenceRouter",
+                PipelineStatus::Completed,
+                &log_snippet,
+                None,
+                None,
+                Some(result.confidence),
+                Some("Grok.Fallback"),
+            );
 
             // Grok Fallback
             if let (Some(grok_backend), Some(grok_model)) = (&self.grok_backend, &self.grok_model) {
@@ -697,87 +726,56 @@ impl SiemAnalyzer {
                         let grok_latency = grok_start.elapsed().as_millis() as u64;
                         if grok_result.confidence > result.confidence {
                             result = grok_result;
-                            if let Some(tx) = event_tx {
-                                let event = PipelineEvent {
-                                    event_id: uuid::Uuid::new_v4(),
-                                    timestamp: chrono::Utc::now(),
-                                    stage: "Grok.Fallback".to_string(),
-                                    status: PipelineStatus::Completed,
-                                    log_snippet: log_snippet.clone(),
-                                    model: Some(grok_model.clone()),
-                                    latency_ms: Some(grok_latency),
-                                    confidence: Some(result.confidence),
-                                    next_stage: Some("AlertGenerator".to_string()),
-                                };
-                                let _ = tx.send(event);
-                            }
-                        } else {
-                            if let Some(tx) = event_tx {
-                                let event = PipelineEvent {
-                                    event_id: uuid::Uuid::new_v4(),
-                                    timestamp: chrono::Utc::now(),
-                                    stage: "Grok.Fallback".to_string(),
-                                    status: PipelineStatus::Completed,
-                                    log_snippet: log_snippet.clone(),
-                                    model: Some(grok_model.clone()),
-                                    latency_ms: Some(grok_latency),
-                                    confidence: Some(grok_result.confidence),
-                                    next_stage: Some("AlertGenerator".to_string()),
-                                };
-                                let _ = tx.send(event);
-                            }
                         }
+                        emit_pipeline_event(
+                            &event_tx,
+                            "Grok.Fallback",
+                            PipelineStatus::Completed,
+                            &log_snippet,
+                            Some(grok_model.clone()),
+                            Some(grok_latency),
+                            Some(result.confidence),
+                            Some("AlertGenerator"),
+                        );
                     }
                     Err(_) => {
-                        if let Some(tx) = event_tx {
-                            let event = PipelineEvent {
-                                event_id: uuid::Uuid::new_v4(),
-                                timestamp: chrono::Utc::now(),
-                                stage: "Grok.Fallback".to_string(),
-                                status: PipelineStatus::Error,
-                                log_snippet: log_snippet.clone(),
-                                model: Some(grok_model.clone()),
-                                latency_ms: Some(grok_start.elapsed().as_millis() as u64),
-                                confidence: None,
-                                next_stage: Some("AlertGenerator".to_string()),
-                            };
-                            let _ = tx.send(event);
-                        }
+                        emit_pipeline_event(
+                            &event_tx,
+                            "Grok.Fallback",
+                            PipelineStatus::Error,
+                            &log_snippet,
+                            Some(grok_model.clone()),
+                            Some(grok_start.elapsed().as_millis() as u64),
+                            None,
+                            Some("AlertGenerator"),
+                        );
                     }
                 }
             }
         } else {
-            if let Some(tx) = event_tx {
-                let event = PipelineEvent {
-                    event_id: uuid::Uuid::new_v4(),
-                    timestamp: chrono::Utc::now(),
-                    stage: "ConfidenceRouter".to_string(),
-                    status: PipelineStatus::Completed,
-                    log_snippet: log_snippet.clone(),
-                    model: None,
-                    latency_ms: None,
-                    confidence: Some(result.confidence),
-                    next_stage: Some("AlertGenerator".to_string()),
-                };
-                let _ = tx.send(event);
-            }
+            emit_pipeline_event(
+                &event_tx,
+                "ConfidenceRouter",
+                PipelineStatus::Completed,
+                &log_snippet,
+                None,
+                None,
+                Some(result.confidence),
+                Some("AlertGenerator"),
+            );
         }
 
         // Alert Generator
-        if let Some(tx) = event_tx {
-            let event = PipelineEvent {
-                event_id: uuid::Uuid::new_v4(),
-                timestamp: chrono::Utc::now(),
-                stage: "AlertGenerator".to_string(),
-                status: PipelineStatus::Completed,
-                log_snippet: log_snippet.clone(),
-                model: None,
-                latency_ms: None,
-                confidence: Some(result.confidence),
-                next_stage: Some("Storage".to_string()),
-            };
-            let _ = tx.send(event);
-        }
+        emit_pipeline_event(
+            &event_tx,
+            "AlertGenerator",
+            PipelineStatus::Completed,
+            &log_snippet,
+            None,
+            None,
+            Some(result.confidence),
+            Some("Storage"),
+        );
 
         // Storage
         if let Some(store) = &self.chroma_store {
@@ -791,20 +789,16 @@ impl SiemAnalyzer {
                 .map_err(|e| LlmError::Other(anyhow::anyhow!("Storage error: {}", e)))?;
         }
 
-        if let Some(tx) = event_tx {
-            let event = PipelineEvent {
-                event_id: uuid::Uuid::new_v4(),
-                timestamp: chrono::Utc::now(),
-                stage: "Storage".to_string(),
-                status: PipelineStatus::Completed,
-                log_snippet: log_snippet.clone(),
-                model: None,
-                latency_ms: None,
-                confidence: None,
-                next_stage: None,
-            };
-            let _ = tx.send(event);
-        }
+        emit_pipeline_event(
+            &event_tx,
+            "Storage",
+            PipelineStatus::Completed,
+            &log_snippet,
+            None,
+            None,
+            None,
+            None,
+        );
 
         Ok(result)
     }
